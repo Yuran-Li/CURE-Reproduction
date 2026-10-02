@@ -42,6 +42,87 @@ python -m recipe.cure.scripts.prepare_data \
 Use `--input-path` and `--output-path` to point the script to your local
 preprocessed DeepMath-103K parquet files.
 
+## Controlled comparison with PAG
+
+This checkout can train CURE against the local PAG run `qwen1p5b_pag`.
+The initial checkpoint is Qwen2.5-1.5B-Instruct, not the SFT checkpoint.
+Only the training algorithm changes. The comparison is not the CURE paper's
+DeepMath-76.8k / Qwen2.5-7B setting.
+
+| Variable | PAG `qwen1p5b_pag` | CURE `qwen1p5b_cure` |
+| --- | --- | --- |
+| Base model | Qwen2.5-1.5B-Instruct | same |
+| Initial checkpoint | `models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306` | same |
+| Training set | `datasets/math7500.parquet` (7500) | same file, prompts not rewritten |
+| Answer reward | `math_verify`, last 300 chars, `boxed_match_priority=0`, math-verify 0.9.0 | `recipe/cure/reward_score.py` |
+| Prompts / step | 512 (`drop_last`, 14 steps/epoch) | 512 |
+| Optimizer steps | 40 epochs = 560 | 40 epochs = 560 |
+| Prompts seen | 286720 | 286720 |
+| Generations / step | 4096 answers+verifies, plus a revision when GenRM says wrong (4096–6144) | 2048 solves + 1024 critiques + 4096 guided = 7168 |
+| Evaluation files | MATH-500 during training; AIME 2024/2025 and Minerva in the standalone eval | same files, same verifier |
+| Val decode | n=8, temperature 0.6, top_p 0.95 | same, but CURE's trainer scores the first solution only |
+| Algorithm | PAG (GAE, GenRM verify, selective revision) | CURE (`adv_estimator=cure`, critique + guided regeneration) |
+
+The `cure` conda env is already installed at `/data/yuranli/envs/cure`.
+Do not train in the `PAG` env: both packages are named `verl`, and this env
+points at the CURE tree.
+
+| Component | Installed |
+| --- | --- |
+| Python | 3.11.16 |
+| torch | 2.6.0+cu124 |
+| vLLM | 0.8.5.post1 |
+| transformers | 4.54.0 |
+| flash-attn | 2.7.4.post1 (cu124 / torch 2.6 wheel; CURE's pin is 2.7.3) |
+| math-verify | 0.9.0, with `latex2sympy2_extended==1.11.0` (same checker as PAG) |
+
+Difficulty bins on this base model and `math7500` are already measured
+(K=4, temperature 1.0, max 2048 tokens, shared answer reward).
+Full dump: `outputs/pass_rate/math7500_qwen1p5b_base.json`.
+
+| Bin | Count | Probability |
+| --- | --- | --- |
+| Zero-pass | 2588 | 0.345 |
+| Partial-pass | 3536 | 0.471 |
+| Full-pass | 1376 | 0.183 |
+
+Mean accuracy is 0.424. Zero + partial is 0.816, so the critique pool is not
+empty and the set is not saturated. Report these three probabilities with the
+comparison. The generation gap (7168 vs 4096–6144) is the method. Report
+prompts seen and rollout count; one epoch of each method is not a matched budget.
+
+### Start training
+
+From the CURE repo, on 8 GPUs:
+
+```bash
+cd /data/yuranli/LLM/2026.04/github_references/CURE
+bash recipe/cure/run_pag_control.sh
+```
+
+The script activates `cure`, sets `PYTHONNOUSERSITE=1` and `VLLM_USE_V1=0`,
+and writes checkpoints to `checkpoints/cure/qwen1p5b_cure`. WandB is on by
+default; set `USE_WANDB=0` for console only. Hydra overrides can be appended
+after the script name.
+
+`verl/trainer/config/data/legacy_data.yaml` was missing from this checkout.
+It is restored from verl 0.5.0; without it Hydra exits before any GPU work
+with `Could not find 'data/legacy_data'`.
+
+### Eval after a checkpoint exists
+
+`RESUME_PATH` must be a `global_step_*` directory. This scores the first
+solution only. PAG's `final_acc` includes the revision turn, so the two
+numbers are not the same metric.
+
+```bash
+cd /data/yuranli/LLM/2026.04/github_references/CURE
+RESUME_PATH=checkpoints/cure/qwen1p5b_cure/global_step_560 \
+  bash recipe/cure/run_eval_pag_control.sh
+```
+
+The paper entry point is unchanged: `bash recipe/cure/run_qwen2.5-7b_math.sh`.
+
 ## Run Main Experiment
 
 ```bash

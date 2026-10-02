@@ -279,6 +279,274 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     return metrics
 
 
+def _outcome_rewards(token_level_scores: torch.Tensor, attention_mask: torch.Tensor, prompt_length: int) -> torch.Tensor:
+    """Reward placed on the last valid response token. Empty responses score 0."""
+    response_mask = attention_mask[:, prompt_length:]
+    lengths = response_mask.sum(dim=-1).long()
+    index = (lengths - 1).clamp(min=0)
+    gathered = token_level_scores.gather(1, index.unsqueeze(1)).squeeze(1)
+    return torch.where(lengths > 0, gathered, torch.zeros_like(gathered))
+
+
+def compute_cure_rollout_metrics(
+    batch: DataProto,
+    tokenizer=None,
+    force_error_conclusion: bool = False,
+    prefix: str = "multiturn/",
+    include_multiturn: bool = True,
+    include_grpo: bool = True,
+) -> dict[str, Any]:
+    """PAG-comparable rollout stats, plus GRPO group stats that a critic would not show.
+
+    Keys under ``prefix`` match PAG's validation logger (``val/multiturn/``):
+    turn_1_accuracy, final_acc, turn_2_accuracy_selection,
+    i_to_c_*, c_to_i_*, and verify_* when the critique verdict is the model's.
+
+    ``final_acc`` replaces each refined solution with the mean accuracy of its
+    guided regenerations and leaves every other solution at its turn-1 score.
+    ``i_to_c_rate`` / ``c_to_i_rate`` are computed on individual regenerations.
+    ``*_rate_gt`` divides those counts by the number of turn-1 solutions, same
+    denominator PAG uses. With ``n_refine`` > 1 that ratio can exceed 1.
+
+    Verify confusion uses PAG's convention (positive = "says the solution is
+    correct"): TP/TN are agreements, FP is "says correct" on a wrong solution,
+    FN is "says wrong" on a correct solution. ``critique_force_error_conclusion``
+    writes the label from the answer reward, so those counts are not logged.
+    """
+    if "task_type" not in batch.non_tensor_batch:
+        return {}
+
+    task_types = np.asarray(batch.non_tensor_batch["task_type"])
+    prompt_length = batch.batch["prompts"].shape[-1]
+    outcome = _outcome_rewards(
+        batch.batch["token_level_scores"],
+        batch.batch["attention_mask"],
+        prompt_length,
+    ).detach().float().cpu()
+
+    solve_idx = np.flatnonzero(task_types == "problem_solving")
+    critique_idx = np.flatnonzero(task_types == "critique")
+    refine_idx = np.flatnonzero(task_types == "refine")
+    metrics: dict[str, Any] = {}
+
+    if solve_idx.size > 0:
+        solve_scores = outcome[solve_idx]
+        if include_multiturn:
+            metrics[f"{prefix}turn_1_accuracy"] = float((solve_scores > 0.5).float().mean())
+        if include_grpo:
+            metrics.update(_grpo_solve_group_metrics(solve_scores, np.asarray(batch.non_tensor_batch["uid"])[solve_idx]))
+
+    if not include_multiturn:
+        return metrics
+
+    if critique_idx.size == 0 or refine_idx.size == 0:
+        if f"{prefix}turn_1_accuracy" in metrics:
+            metrics[f"{prefix}final_acc"] = metrics[f"{prefix}turn_1_accuracy"]
+        return metrics
+
+    crit_ids = np.asarray(batch.non_tensor_batch["critique_id"])
+    reward_models = batch.non_tensor_batch["reward_model"]
+    refine_by_critique: dict[Any, list[int]] = defaultdict(list)
+    for row in refine_idx.tolist():
+        refine_by_critique[crit_ids[row]].append(row)
+
+    final_sum = float(outcome[solve_idx].sum()) if solve_idx.size else 0.0
+    n_solves = int(solve_idx.size)
+    refine_scores: list[float] = []
+    i_to_c = c_to_i = 0
+    n_wrong_refined = n_correct_refined = 0
+
+    for row in critique_idx.tolist():
+        children = refine_by_critique.get(crit_ids[row], [])
+        if not children:
+            continue
+        original_correct = float(reward_models[row]["ground_truth"]) > 0.5
+        child_scores = [float(outcome[child]) for child in children]
+        refine_scores.extend(child_scores)
+        final_sum += float(np.mean(child_scores)) - float(reward_models[row]["ground_truth"])
+        for score in child_scores:
+            child_correct = score > 0.5
+            if not original_correct:
+                n_wrong_refined += 1
+                i_to_c += int(child_correct)
+            else:
+                n_correct_refined += 1
+                c_to_i += int(not child_correct)
+
+    if n_solves > 0:
+        metrics[f"{prefix}final_acc"] = final_sum / n_solves
+    if refine_scores:
+        metrics[f"{prefix}turn_2_accuracy_selection"] = float(np.mean(refine_scores))
+    if n_wrong_refined > 0:
+        metrics[f"{prefix}i_to_c_rate"] = i_to_c / n_wrong_refined
+        metrics[f"{prefix}i_to_c_count"] = i_to_c
+        if n_solves > 0:
+            metrics[f"{prefix}i_to_c_rate_gt"] = i_to_c / n_solves
+    if n_correct_refined > 0:
+        metrics[f"{prefix}c_to_i_rate"] = c_to_i / n_correct_refined
+        metrics[f"{prefix}c_to_i_count"] = c_to_i
+        if n_solves > 0:
+            metrics[f"{prefix}c_to_i_rate_gt"] = c_to_i / n_solves
+
+    if not force_error_conclusion and tokenizer is not None:
+        for key, value in _critique_verify_metrics(batch, tokenizer, critique_idx, prompt_length).items():
+            metrics[f"{prefix}{key.removeprefix('multiturn/')}"] = value
+    return metrics
+
+
+def compute_pag_aligned_val_metrics(
+    turn1_correct: np.ndarray,
+    verify_agree: np.ndarray,
+    revised: np.ndarray,
+    turn2_correct: np.ndarray,
+    prefix: str = "val/multiturn/",
+) -> dict[str, float]:
+    """Aggregate one generate-verify-regen trajectory per sample, the way PAG val does.
+
+    ``verify_agree`` is 1 when the verifier's label matches the turn-1 answer, which is
+    what PAG stores in ``verify_accuracies``. A sample is revised only when the verifier
+    does not say the answer is correct. ``final_acc`` keeps turn 1 unless that sample
+    was revised, in which case it uses that one regeneration.
+    """
+    turn1_correct = np.asarray(turn1_correct, dtype=bool)
+    verify_agree = np.asarray(verify_agree, dtype=bool)
+    revised = np.asarray(revised, dtype=bool)
+    turn2_correct = np.asarray(turn2_correct, dtype=bool)
+    n = int(turn1_correct.shape[0])
+    if n == 0:
+        return {}
+
+    final = turn1_correct.astype(np.float64)
+    final[revised] = turn2_correct[revised].astype(np.float64)
+    answer_correct = turn1_correct
+    agrees = verify_agree
+    true_positive = int(np.sum(agrees & answer_correct))
+    false_positive = int(np.sum(~agrees & ~answer_correct))
+    false_negative = int(np.sum(~agrees & answer_correct))
+    true_negative = int(np.sum(agrees & ~answer_correct))
+    precision = true_positive / (true_positive + false_positive) if (true_positive + false_positive) else 0.0
+    recall = true_positive / (true_positive + false_negative) if (true_positive + false_negative) else 0.0
+    recall_negative = true_negative / (true_negative + false_positive) if (true_negative + false_positive) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+
+    metrics = {
+        f"{prefix}turn_1_accuracy": float(answer_correct.mean()),
+        f"{prefix}final_acc": float(final.mean()),
+        f"{prefix}verify_1_accuracy": float(agrees.mean()),
+        f"{prefix}verify_TP": true_positive,
+        f"{prefix}verify_FP": false_positive,
+        f"{prefix}verify_FN": false_negative,
+        f"{prefix}verify_TN": true_negative,
+        f"{prefix}verify_precision": precision,
+        f"{prefix}verify_recall": recall,
+        f"{prefix}verify_recall_negative": recall_negative,
+        f"{prefix}verify_f1": f1,
+    }
+    if np.any(revised):
+        metrics[f"{prefix}turn_2_accuracy_selection"] = float(turn2_correct[revised].mean())
+        revised_wrong = revised & ~answer_correct
+        revised_right = revised & answer_correct
+        i_to_c = int(np.sum(revised_wrong & turn2_correct))
+        c_to_i = int(np.sum(revised_right & ~turn2_correct))
+        n_wrong = int(revised_wrong.sum())
+        n_right = int(revised_right.sum())
+        if n_wrong > 0:
+            metrics[f"{prefix}i_to_c_rate"] = i_to_c / n_wrong
+            metrics[f"{prefix}i_to_c_count"] = i_to_c
+            metrics[f"{prefix}i_to_c_rate_gt"] = i_to_c / n
+        if n_right > 0:
+            metrics[f"{prefix}c_to_i_rate"] = c_to_i / n_right
+            metrics[f"{prefix}c_to_i_count"] = c_to_i
+            metrics[f"{prefix}c_to_i_rate_gt"] = c_to_i / n
+    return metrics
+
+
+def _grpo_solve_group_metrics(solve_scores: torch.Tensor, uids: np.ndarray) -> dict[str, float]:
+    """Within-prompt reward spread. GRPO's baseline is this group mean; a zero std sends advantage to 0."""
+    grouped: dict[Any, list[float]] = defaultdict(list)
+    for uid, score in zip(uids.tolist(), solve_scores.tolist()):
+        grouped[uid].append(float(score))
+
+    zero_pass = partial_pass = full_pass = 0
+    stds: list[float] = []
+    for scores in grouped.values():
+        mean_acc = float(np.mean(scores))
+        stds.append(float(np.std(scores)))
+        if mean_acc <= 0.0:
+            zero_pass += 1
+        elif mean_acc >= 1.0:
+            full_pass += 1
+        else:
+            partial_pass += 1
+
+    n_groups = max(len(grouped), 1)
+    zero_std = sum(std <= 1e-8 for std in stds)
+    return {
+        "grpo/solve_group_count": float(len(grouped)),
+        "grpo/solve_zero_pass_frac": zero_pass / n_groups,
+        "grpo/solve_partial_pass_frac": partial_pass / n_groups,
+        "grpo/solve_full_pass_frac": full_pass / n_groups,
+        "grpo/solve_group_std_mean": float(np.mean(stds)) if stds else 0.0,
+        "grpo/solve_zero_std_frac": zero_std / n_groups,
+    }
+
+
+def _critique_verify_metrics(
+    batch: DataProto,
+    tokenizer,
+    critique_idx: np.ndarray,
+    prompt_length: int,
+) -> dict[str, float]:
+    """Score a free ERROR_FOUND verdict the same way PAG scores GenRM."""
+    attention = batch.batch["attention_mask"]
+    responses = batch.batch["responses"]
+    reward_models = batch.non_tensor_batch["reward_model"]
+    true_positive = false_positive = false_negative = true_negative = 0
+    judged = 0
+
+    for row in critique_idx.tolist():
+        valid_len = int(attention[row, prompt_length:].sum().item())
+        if valid_len <= 0:
+            continue
+        text = tokenizer.decode(responses[row, :valid_len].detach().cpu().tolist(), skip_special_tokens=False)
+        lower = text.lower()
+        says_wrong = "error_found: true" in lower
+        says_correct = "error_found: false" in lower
+        if says_wrong == says_correct:
+            continue
+        answer_correct = float(reward_models[row]["ground_truth"]) > 0.5
+        # Agreement bit, matching PAG's genrm_score in the confusion matrix.
+        agrees = says_correct == answer_correct
+        judged += 1
+        if agrees and answer_correct:
+            true_positive += 1
+        elif (not agrees) and (not answer_correct):
+            false_positive += 1
+        elif (not agrees) and answer_correct:
+            false_negative += 1
+        else:
+            true_negative += 1
+
+    if judged == 0:
+        return {}
+
+    precision = true_positive / (true_positive + false_positive) if (true_positive + false_positive) else 0.0
+    recall = true_positive / (true_positive + false_negative) if (true_positive + false_negative) else 0.0
+    recall_negative = true_negative / (true_negative + false_positive) if (true_negative + false_positive) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    return {
+        "multiturn/verify_1_accuracy": (true_positive + true_negative) / judged,
+        "multiturn/verify_TP": true_positive,
+        "multiturn/verify_FP": false_positive,
+        "multiturn/verify_FN": false_negative,
+        "multiturn/verify_TN": true_negative,
+        "multiturn/verify_precision": precision,
+        "multiturn/verify_recall": recall,
+        "multiturn/verify_recall_negative": recall_negative,
+        "multiturn/verify_f1": f1,
+    }
+
+
 def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> dict[str, Any]:
     """
     Computes timing metrics for different processing stages in PPO training.

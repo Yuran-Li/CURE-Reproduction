@@ -57,6 +57,35 @@ def _extract_content(tensor: torch.Tensor, start_tag: str, end_tag: str, tokeniz
     pattern = re.escape(start_tag) + r"(.*?)" + re.escape(end_tag)
     return [m.group(1).strip() if (m:=re.search(pattern,t,re.DOTALL)) else "" for t in decoded]
 
+
+_USER_BLOCK = re.compile(r"<\|im_start\|>user\n(.*?)<\|im_end\|>", re.DOTALL)
+_CURE_USER_SUFFIX = "\nPlease reason step by step"
+
+
+def _extract_user_question(token_rows, tokenizer) -> list:
+    """Pull the problem text out of a chat-templated prompt.
+
+    Official CURE rows append ``Please reason step by step...`` to the user
+    turn, so the problem is the text before that suffix. PAG rows put that
+    sentence in the system turn, which comes before ``<|im_start|>user``.
+    Searching for ``user`` and then the suffix therefore matches nothing and
+    the critique / refine prompts are built with an empty Problem.
+    """
+    decoded = tokenizer.batch_decode(token_rows, skip_special_tokens=False)
+    questions = []
+    for text in decoded:
+        match = _USER_BLOCK.search(text)
+        if match:
+            content = match.group(1).strip()
+            suffix_at = content.find(_CURE_USER_SUFFIX)
+            if suffix_at >= 0:
+                content = content[:suffix_at].strip()
+            questions.append(content)
+            continue
+        fallback = re.search(r"user(.*?)Please reason step by step", text, re.DOTALL)
+        questions.append(fallback.group(1).strip() if fallback else "")
+    return questions
+
 def _normalize_size_divisor(size_divisor: Optional[int]) -> int:
     return max(1, int(size_divisor or 1))
 
@@ -341,12 +370,7 @@ def update_data_for_critique(
         _pre_process_inputs(pad_token_id, row_ids)
         for row_ids in prompt_ids
     ]
-    user_queries = _extract_content(
-        processed_tokens, 
-        "user",
-        "Please reason step by step",
-        tokenizer=tokenizer
-    )
+    user_queries = _extract_user_question(processed_tokens, tokenizer)
     
     # 2. Extract Assistant Responses
     batch_size = response_ids.size(0)

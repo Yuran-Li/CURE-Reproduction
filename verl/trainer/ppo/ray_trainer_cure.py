@@ -44,6 +44,8 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
+    compute_cure_rollout_metrics,
+    compute_pag_aligned_val_metrics,
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
@@ -519,6 +521,109 @@ class RayPPOTrainer:
 
         return gen_batch
 
+    def _generate_for_val(self, gen_batch: DataProto, task_type: str) -> DataProto:
+        """Chunked val-temperature generation. Sampling follows val_kwargs."""
+        gen_batch.meta_info = {
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "recompute_log_prob": False,
+            "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+            "validate": True,
+            "global_steps": self.global_steps,
+            "task_type": task_type,
+        }
+        size_divisor = (
+            self.actor_rollout_wg.world_size
+            if not self.async_rollout_mode
+            else self.config.actor_rollout_ref.rollout.agent.num_workers
+        )
+        chunk = 2048
+        outputs = []
+        for start in range(0, len(gen_batch), chunk):
+            piece = gen_batch.select_idxs(list(range(start, min(start + chunk, len(gen_batch)))))
+            padded, pad_size = pad_dataproto_to_divisor(piece, size_divisor)
+            if not self.async_rollout_mode:
+                generated = self.actor_rollout_wg.generate_sequences(padded)
+            else:
+                generated = self.async_rollout_manager.generate_sequences(padded)
+            outputs.append(unpad_dataproto(generated, pad_size=pad_size))
+        return outputs[0] if len(outputs) == 1 else DataProto.concat(outputs)
+
+    def _response_text(self, batch: DataProto, index: int) -> str:
+        prompt_length = batch.batch["prompts"].shape[-1]
+        valid_len = int(batch.batch["attention_mask"][index, prompt_length:].sum().item())
+        if valid_len <= 0:
+            return ""
+        token_ids = batch.batch["responses"][index, :valid_len]
+        return self.tokenizer.decode(token_ids.detach().cpu().tolist(), skip_special_tokens=False)
+
+    @staticmethod
+    def _critique_verdict(text: str) -> str:
+        """Map a free critique to PAG's verify label. Unparsed text is not 'correct'."""
+        lower = text.lower()
+        says_wrong = "error_found: true" in lower
+        says_correct = "error_found: false" in lower
+        if says_wrong and not says_correct:
+            return "wrong"
+        if says_correct and not says_wrong:
+            return "correct"
+        return "none"
+
+    def _val_multiturn_metrics(self, solve_batch: DataProto) -> dict:
+        """One generate, one verify, and at most one regen per val sample.
+
+        The val batch is already repeated by ``val_kwargs.n`` (8). Every sample is
+        critiqued without the forced ERROR_FOUND label. Regen runs once when the
+        critique does not say the answer is correct, matching PAG's val gate.
+        Nothing here is used for the parameter update.
+        """
+        n = len(solve_batch)
+        turn1_correct = solve_batch.batch["token_level_scores"].sum(dim=-1).detach().cpu().numpy() > 0.5
+        c_batch = update_data_for_critique(
+            solve_batch,
+            tokenizer=self.tokenizer,
+            focus_on_failed_solutions=False,
+            force_error_conclusion=False,
+            size_divisor=1,
+        )
+        c_gen = self._get_gen_batch(c_batch)
+        c_out = self._generate_for_val(c_gen, "critique")
+        c_batch = c_batch.union(c_out)
+
+        verdicts = [self._critique_verdict(self._response_text(c_batch, i)) for i in range(n)]
+        verify_agree = np.array(
+            [
+                (verdict == "correct" and correct) or (verdict == "wrong" and not correct)
+                for verdict, correct in zip(verdicts, turn1_correct)
+            ],
+            dtype=bool,
+        )
+        # PAG val revises unless the verifier explicitly says correct.
+        revised = np.array([verdict != "correct" for verdict in verdicts], dtype=bool)
+        turn2_correct = np.zeros(n, dtype=bool)
+        revise_idx = np.flatnonzero(revised)
+        if revise_idx.size > 0:
+            r_src = c_batch.select_idxs(revise_idx.tolist())
+            r_batch = update_data_for_refine(
+                r_src,
+                tokenizer=self.tokenizer,
+                only_wrong_original=False,
+                size_divisor=1,
+            )
+            r_gen = self._get_gen_batch(r_batch)
+            r_out = self._generate_for_val(r_gen, "refine")
+            r_batch = r_batch.union(r_out)
+            reward = self.val_reward_fn(r_batch, return_dict=True)["reward_tensor"]
+            regen_correct = reward.sum(dim=-1).detach().cpu().numpy() > 0.5
+            turn2_correct[revise_idx] = regen_correct
+
+        return compute_pag_aligned_val_metrics(
+            turn1_correct=turn1_correct,
+            verify_agree=verify_agree,
+            revised=revised,
+            turn2_correct=turn2_correct,
+        )
+
     def _validate(self):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -530,6 +635,7 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        solve_batches = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -599,6 +705,8 @@ class RayPPOTrainer:
                 raise ValueError("val_reward_fn must be provided for validation.")
             result = self.val_reward_fn(test_batch, return_dict=True)
             reward_tensor = result["reward_tensor"]
+            test_batch.batch["token_level_scores"] = reward_tensor
+            solve_batches.append(test_batch)
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
@@ -655,6 +763,14 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/min"] = sample_turns.min()
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+
+        if (
+            solve_batches
+            and self.config.trainer.get("critique", False)
+            and self.config.trainer.get("refine", False)
+        ):
+            solved = solve_batches[0] if len(solve_batches) == 1 else DataProto.concat(solve_batches)
+            metric_dict.update(self._val_multiturn_metrics(solved))
 
         return metric_dict
 
@@ -1465,6 +1581,13 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                if "task_type" in batch.non_tensor_batch:
+                    metrics.update(
+                        compute_cure_rollout_metrics(
+                            batch,
+                            include_multiturn=False,
+                        )
+                    )
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
